@@ -1,90 +1,111 @@
 import datetime
+import os
 
-from fastapi import FastAPI
-import uvicorn  # https://fastapi.tiangolo.com/tutorial/debugging
+import uvicorn
+from fastapi import FastAPI, status
 
-from Models import *
-from DB import *
-from config import *
+from DB import DBWorker
+from Models import NewDrug
+from config import EVENING_TIME, MAX_OPEN_ENDED_TAKINGS, MORNING_TIME, NEXT_TAKINGS_PERIOD
 
-app = FastAPI()
-database = DBWorker()
+app = FastAPI(
+    title="Medication Schedule API",
+    description="API for creating medication schedules and calculating upcoming doses.",
+    version="1.0.0",
+)
+database = DBWorker(os.getenv("DATABASE_PATH", "db.db"))
+
+UNIT_TO_MINUTES = {
+    "minute": 1,
+    "minutes": 1,
+    "hour": 60,
+    "hours": 60,
+    "day": 60 * 24,
+    "days": 60 * 24,
+    "week": 60 * 24 * 7,
+    "weeks": 60 * 24 * 7,
+}
 
 
-def get_schedule(start_time, repeat_time, repeats) -> list[datetime.datetime]:
+def get_schedule(start_time: int, repeat_time: int, repeats: int) -> list[datetime.datetime]:
+    """Build a schedule, moving night-time doses to the next morning."""
     if repeats == -1:
-        repeats = size_of_infinity
-    drugs_time = []
+        repeats = MAX_OPEN_ENDED_TAKINGS
+
+    taking_times: list[datetime.datetime] = []
     current_time = start_time
+
     for _ in range(repeats):
-        # Проверяем, не выпадает ли время приёма на ночь (с 22:00 до 8:00)
-        if (current_time % (24 * 60)) >= evening_time or (current_time % (24 * 60)) < morning_time:
-            # Если выпадает на ночь, переносим на утро следующего дня
-            current_time = (current_time // (24 * 60) + 1) * (24 * 60) + morning_time
-        dt = datetime.datetime.fromtimestamp(current_time * 60)
-        rounded_minutes = (dt.minute // 15) * 15
-        if dt.minute % 15 >= 7.5:  # Если остаток от деления на 15 больше или равен 7.5, округляем вверх
-            rounded_minutes += 15
-        if rounded_minutes >= 60:  # Если округление минут превышает 59, увеличиваем час и обнуляем минуты
+        minute_of_day = current_time % (24 * 60)
+        if minute_of_day >= EVENING_TIME or minute_of_day < MORNING_TIME:
+            current_time = (current_time // (24 * 60) + 1) * (24 * 60) + MORNING_TIME
+
+        value = datetime.datetime.fromtimestamp(current_time * 60)
+        rounded_minutes = ((value.minute + 7) // 15) * 15
+        if rounded_minutes == 60:
+            value += datetime.timedelta(hours=1)
             rounded_minutes = 0
-            dt += datetime.timedelta(hours=1)
-        drugs_time.append(dt.replace(minute=rounded_minutes))
+
+        taking_times.append(value.replace(minute=rounded_minutes, second=0, microsecond=0))
         current_time += repeat_time
-    return drugs_time
+
+    return taking_times
 
 
-# Нет в ТЗ
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/all_takings")
-async def all_takings(user_id: int):
-    res = {}
-    for i in database.get_drugs_by_uuid(user_id):
-        res[i[0]] = list(get_schedule(i[1], i[2], i[3]))
-    return res
+async def all_takings(user_id: int) -> dict[str, list[datetime.datetime]]:
+    return {
+        name: get_schedule(start_time, repeat_time, repeats)
+        for name, start_time, repeat_time, repeats in database.get_drugs_by_uuid(user_id)
+    }
 
 
 @app.get("/next_takings")
-async def next_takings(user_id: int):
-    res = {}
-    time_now = datetime.datetime.now()
-    print(type(time_now))
-    for i in database.get_drugs_by_uuid(user_id):
-        res[i[0]] = list(filter(
-            lambda x: True if time_now < x < (time_now + datetime.timedelta(minutes=next_takings_period)) else False,
-            get_schedule(i[1], i[2], i[3])))
-    return res
+async def next_takings(user_id: int) -> dict[str, list[datetime.datetime]]:
+    now = datetime.datetime.now()
+    period_end = now + datetime.timedelta(minutes=NEXT_TAKINGS_PERIOD)
+    result: dict[str, list[datetime.datetime]] = {}
+
+    for name, start_time, repeat_time, repeats in database.get_drugs_by_uuid(user_id):
+        result[name] = [
+            taking_time
+            for taking_time in get_schedule(start_time, repeat_time, repeats)
+            if now < taking_time < period_end
+        ]
+    return result
 
 
 @app.get("/schedules")
-async def schedules(user_id: int):
-    res = {}
-    for i in database.get_drugs_by_uuid(user_id):
-        res[i[0]] = {
-            "start_time": datetime.datetime.fromtimestamp(i[1] * 60),
-            "repeat_time": datetime.timedelta(minutes=i[2]),
-            "repeats": i[3]
+async def schedules(user_id: int) -> dict[str, dict[str, object]]:
+    return {
+        name: {
+            "start_time": datetime.datetime.fromtimestamp(start_time * 60),
+            "repeat_time_minutes": repeat_time,
+            "repeats": repeats,
         }
-    return res
+        for name, start_time, repeat_time, repeats in database.get_drugs_by_uuid(user_id)
+    }
 
 
-@app.post("/schedule")
-async def new_record(drugs: NewDrugs):
-    curr_time = int(datetime.datetime.now().timestamp()) // 60
-
-    repeats_min = drugs.repeats_value
-    match drugs.time_format:
-        case "hours":
-            repeats_min *= 60
-        case "days":
-            repeats_min *= 60 * 24
-        case "week":
-            repeats_min *= 60 * 24 * 7
-
-    database.add_drug(user_id=drugs.uuid,
-                      name=drugs.name,
-                      start_time=curr_time,
-                      repeat_time=repeats_min,
-                      repeats=drugs.duration)
+@app.post("/schedule", status_code=status.HTTP_201_CREATED)
+async def new_record(drug: NewDrug) -> dict[str, int | str]:
+    repeat_time = drug.repeats_value * UNIT_TO_MINUTES[drug.time_format]
+    start_time = int(datetime.datetime.now().timestamp()) // 60
+    schedule_id = database.add_drug(
+        user_id=drug.uuid,
+        name=drug.name,
+        start_time=start_time,
+        repeat_time=repeat_time,
+        repeats=drug.duration,
+    )
+    return {"status": "created", "schedule_id": schedule_id}
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, port=8080)
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+

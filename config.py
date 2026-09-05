@@ -1,6 +1,7 @@
-# UTC
-morning_time = 6 * 60
-evening_time = 20 * 60
+# Time values are stored in minutes.
+MORNING_TIME = 6 * 60
+EVENING_TIME = 20 * 60
 
-next_takings_period = 60
-size_of_infinity = 200
+NEXT_TAKINGS_PERIOD = 60
+MAX_OPEN_ENDED_TAKINGS = 200
+
